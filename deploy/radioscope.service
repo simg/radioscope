@@ -1,0 +1,16 @@
+[Unit]
+Description=Radioscope Wi-Fi packet tick monitor
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Environment=MONITOR_INTERFACE=wlan1mon
+Environment=HTTP_BIND=0.0.0.0:8080
+ExecStart=/usr/local/bin/radioscope
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

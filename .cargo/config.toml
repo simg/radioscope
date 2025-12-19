@@ -1,0 +1,8 @@
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+ar = "aarch64-linux-gnu-ar"
+rustflags = [
+    "-Clink-arg=--sysroot=/opt/pi-sysroot",
+    "-Clink-arg=-L/opt/pi-sysroot/lib/aarch64-linux-gnu",
+    "-Clink-arg=-L/opt/pi-sysroot/usr/lib/aarch64-linux-gnu",
+]
