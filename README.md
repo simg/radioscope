@@ -6,6 +6,22 @@ A built-in web UI is served over an access point hosted on the PI's built in wif
 
 Under the hood it uses Dioxus SSR for the UI, Axum for the API, `libpcap` for capture, and `cpal`/ALSA for sound. A systemd unit handles startup on Raspberry Pi OS, and helper scripts configure the AP and monitor interface for you.
 
+## Screenshots and Sample
+
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;">
+  <img src="screenshots/channel-selector.png" alt="Channel selector" style="width:100%;height:auto;">
+  <img src="screenshots/device-filter.png" alt="Device filter" style="width:100%;height:auto;">
+  <img src="screenshots/packet-type-filter.png" alt="Packet type filter" style="width:100%;height:auto;">
+  <img src="screenshots/sound-configuration.png" alt="Sound configuration" style="width:100%;height:auto;">
+  <img src="screenshots/system-shutdown.png" alt="System shutdown" style="width:100%;height:auto;">
+</div>
+
+<p>Sample audio:</p>
+<audio controls preload="none" style="max-width:320px;">
+  <source src="screenshots/sample.mp3" type="audio/mpeg">
+  <a href="screenshots/sample.mp3">Download sample.mp3</a>.
+</audio>
+
 ## Components
 
 - Packet capture via `libpcap` (`pcap` crate).
