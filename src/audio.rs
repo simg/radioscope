@@ -17,6 +17,10 @@ pub enum SoundId {
     CtsKnockback,
     AckClick,
     DataTick,
+    EvilInfo,
+    EvilWarning,
+    EvilHigh,
+    EvilCritical,
     RetryGlitch,
 }
 
@@ -139,6 +143,11 @@ fn build_palette(sample_rate: u32) -> SoundPalette {
     sounds.insert(CtsKnockback, build_tick(sample_rate, 480.0, 24, 0.32));
     sounds.insert(AckClick, build_ack(sample_rate));
     sounds.insert(DataTick, build_tick(sample_rate, 820.0, 22, 0.2));
+    let evil_claxon = build_claxon(sample_rate, 840.0, 0.22, 0.95);
+    sounds.insert(EvilInfo, evil_claxon.clone());
+    sounds.insert(EvilWarning, evil_claxon.clone());
+    sounds.insert(EvilHigh, evil_claxon.clone());
+    sounds.insert(EvilCritical, evil_claxon);
     sounds.insert(RetryGlitch, build_noise(sample_rate, 10, 0.05));
 
     SoundPalette { sounds }
@@ -214,6 +223,27 @@ fn build_ack(sample_rate: u32) -> Vec<f32> {
         base[i] += noise[i];
     }
     base
+}
+
+fn build_claxon(sample_rate: u32, base_freq: f32, duration_s: f32, volume: f32) -> Vec<f32> {
+    let samples = (sample_rate as f32 * duration_s).max(1.0) as usize;
+    let mut data = Vec::with_capacity(samples);
+    let wobble_freq = 6.0; // slow vibrato for urgency
+    for i in 0..samples {
+        let t = i as f32 / sample_rate as f32;
+        let vibrato = (2.0 * PI * wobble_freq * t).sin() * 8.0;
+        let freq = base_freq + vibrato;
+        let env = if i < samples / 6 {
+            i as f32 / (samples / 6) as f32
+        } else if i > samples - samples / 5 {
+            (samples - i) as f32 / (samples / 5) as f32
+        } else {
+            1.0
+        };
+        let val = (2.0 * PI * freq * t).sin() * volume * env;
+        data.push(val);
+    }
+    data
 }
 
 fn pop_sample(queue: &Arc<Mutex<VecDeque<f32>>>) -> f32 {

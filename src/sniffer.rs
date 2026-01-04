@@ -6,21 +6,23 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::devices::{DeviceRole, DeviceTracker};
 use crate::events::{EventKind, PacketEvent, RateKey};
+use crate::evil_twin::{ApObservation, CapabilitiesFingerprint, RsnProfile};
 
 pub fn spawn_sniffer(
     interface: String,
     tx: UnboundedSender<PacketEvent>,
     devices: Arc<DeviceTracker>,
+    evil_tx: UnboundedSender<ApObservation>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let tx_clone = tx.clone();
-        match run(&interface, tx, Arc::clone(&devices)) {
+        match run(&interface, tx, Arc::clone(&devices), evil_tx.clone()) {
             Ok(_) => {}
             Err(err) => {
                 tracing::warn!(
                     "Primary sniffer setup failed on {interface}: {err:?}, retrying without rfmon flag"
                 );
-                if let Err(err2) = run_without_rfmon(&interface, tx_clone, devices) {
+                if let Err(err2) = run_without_rfmon(&interface, tx_clone, devices, evil_tx) {
                     tracing::error!("Sniffer error on {interface}: {err2:?}");
                 }
             }
@@ -32,6 +34,7 @@ fn run(
     interface: &str,
     tx: UnboundedSender<PacketEvent>,
     devices: Arc<DeviceTracker>,
+    evil_tx: UnboundedSender<ApObservation>,
 ) -> Result<()> {
     let mut cap = Capture::from_device(interface)
         .with_context(|| format!("Unable to open device {interface}"))?
@@ -48,6 +51,9 @@ fn run(
             Ok(packet) => {
                 if let Some(frame) = parse_radiotap_and_frame(packet.data) {
                     observe_device(&devices, &frame);
+                    if let Some(obs) = to_ap_observation(&frame) {
+                        let _ = evil_tx.send(obs);
+                    }
                     if let Some(evt) = classify_frame(&frame) {
                         let _ = tx.send(evt);
                     }
@@ -66,6 +72,7 @@ fn run_without_rfmon(
     interface: &str,
     tx: UnboundedSender<PacketEvent>,
     devices: Arc<DeviceTracker>,
+    evil_tx: UnboundedSender<ApObservation>,
 ) -> Result<()> {
     let mut cap = Capture::from_device(interface)
         .with_context(|| format!("Unable to open device {interface} (fallback)"))?
@@ -81,6 +88,9 @@ fn run_without_rfmon(
             Ok(packet) => {
                 if let Some(frame) = parse_radiotap_and_frame(packet.data) {
                     observe_device(&devices, &frame);
+                    if let Some(obs) = to_ap_observation(&frame) {
+                        let _ = evil_tx.send(obs);
+                    }
                     if let Some(evt) = classify_frame(&frame) {
                         let _ = tx.send(evt);
                     }
@@ -108,6 +118,8 @@ struct ParsedFrame<'a> {
     signal_dbm: Option<i8>,
     ssid: Option<String>,
     channel: Option<u16>,
+    rsn: Option<RsnProfile>,
+    capabilities: Option<CapabilitiesFingerprint>,
 }
 
 fn classify_frame(parsed: &ParsedFrame) -> Option<PacketEvent> {
@@ -263,6 +275,19 @@ fn classify_data(subtype: u16, retry: bool, frame: &ParsedFrame) -> Option<Packe
     })
 }
 
+fn to_ap_observation(frame: &ParsedFrame) -> Option<ApObservation> {
+    let ssid = frame.ssid.clone()?;
+    let bssid = frame.bssid?;
+    Some(ApObservation {
+        ssid: Some(ssid),
+        bssid: Some(bssid),
+        channel: frame.channel,
+        rssi: frame.signal_dbm,
+        rsn: frame.rsn.clone(),
+        capabilities: frame.capabilities.clone(),
+    })
+}
+
 fn observe_device(tracker: &DeviceTracker, frame: &ParsedFrame) {
     if let Some(mac) = frame.addr2 {
         tracker.observe(
@@ -345,6 +370,124 @@ fn parse_ds_channel(subtype: u16, payload: &[u8]) -> Option<u16> {
         idx += len;
     }
     None
+}
+
+fn parse_beacon_interval(subtype: u16, payload: &[u8]) -> Option<u16> {
+    if !(subtype == 8 || subtype == 5) {
+        return None;
+    }
+    if payload.len() < 10 {
+        return None;
+    }
+    Some(u16::from_le_bytes([payload[8], payload[9]]))
+}
+
+fn parse_capabilities(subtype: u16, payload: &[u8]) -> (Vec<u8>, bool, bool, bool) {
+    let mut rates = Vec::new();
+    let mut has_ht = false;
+    let mut has_vht = false;
+    let mut has_he = false;
+    let start = mgmt_ie_start(subtype, payload);
+    if start.is_none() {
+        return (rates, has_ht, has_vht, has_he);
+    }
+    let mut idx = start.unwrap();
+    while idx + 2 <= payload.len() {
+        let id = payload[idx];
+        let len = payload[idx + 1] as usize;
+        idx += 2;
+        if idx + len > payload.len() {
+            break;
+        }
+        match id {
+            1 | 50 => rates.extend_from_slice(&payload[idx..idx + len]),
+            45 => has_ht = true,
+            191 => has_vht = true,
+            255 => has_he = true,
+            _ => {}
+        }
+        idx += len;
+    }
+    (rates, has_ht, has_vht, has_he)
+}
+
+fn parse_rsn(subtype: u16, payload: &[u8]) -> Option<RsnProfile> {
+    let start = mgmt_ie_start(subtype, payload)?;
+    let mut idx = start;
+    while idx + 2 <= payload.len() {
+        let id = payload[idx];
+        let len = payload[idx + 1] as usize;
+        idx += 2;
+        if idx + len > payload.len() {
+            break;
+        }
+        if id == 48 && len >= 2 {
+            let mut cursor = idx;
+            cursor += 2; // version
+            if cursor + 4 > idx + len {
+                break;
+            }
+            let group_cipher = read_suite(&payload[cursor..cursor + 4]);
+            cursor += 4;
+            if cursor + 2 > idx + len {
+                break;
+            }
+            let pairwise_count = u16::from_le_bytes([payload[cursor], payload[cursor + 1]]) as usize;
+            cursor += 2;
+            let mut ciphers = Vec::new();
+            if cursor + 4 * pairwise_count > idx + len {
+                break;
+            }
+            for _ in 0..pairwise_count {
+                ciphers.push(read_suite(&payload[cursor..cursor + 4]));
+                cursor += 4;
+            }
+            if cursor + 2 > idx + len {
+                break;
+            }
+            let akm_count = u16::from_le_bytes([payload[cursor], payload[cursor + 1]]) as usize;
+            cursor += 2;
+            let mut akms = Vec::new();
+            if cursor + 4 * akm_count > idx + len {
+                break;
+            }
+            for _ in 0..akm_count {
+                akms.push(read_suite(&payload[cursor..cursor + 4]));
+                cursor += 4;
+            }
+            let mut pmf_required = false;
+            let mut pmf_capable = false;
+            if cursor + 2 <= idx + len {
+                let caps = u16::from_le_bytes([payload[cursor], payload[cursor + 1]]);
+                pmf_capable = caps & (1 << 7) != 0;
+                pmf_required = caps & (1 << 6) != 0;
+            }
+            let mut all_ciphers = Vec::new();
+            all_ciphers.push(group_cipher);
+            all_ciphers.extend(ciphers);
+            return Some(RsnProfile {
+                akms,
+                ciphers: all_ciphers,
+                pmf_required,
+                pmf_capable,
+                transition_mode: None,
+            });
+        }
+        idx += len;
+    }
+    None
+}
+
+fn read_suite(bytes: &[u8]) -> String {
+    if bytes.len() < 4 {
+        return "unknown".to_string();
+    }
+    let oui = &bytes[..3];
+    let suite_type = bytes[3];
+    format!(
+        "{:02X}{:02X}{:02X}-{:02X}",
+        oui[0], oui[1], oui[2], suite_type
+    )
 }
 
 fn mgmt_ie_start(subtype: u16, payload: &[u8]) -> Option<usize> {
@@ -441,10 +584,21 @@ fn parse_radiotap_and_frame(data: &[u8]) -> Option<ParsedFrame<'_>> {
     let signal_dbm = signal.as_ref().and_then(|s| s.dbm);
     let mut channel = signal.as_ref().and_then(|s| s.channel);
     let ssid = parse_ssid(kind_bits, subtype, payload);
+    let mut rsn = None;
+    let mut capabilities = None;
     if kind_bits == 0 {
         if let Some(ds) = parse_ds_channel(subtype, payload) {
             channel = Some(ds);
         }
+        rsn = parse_rsn(subtype, payload);
+        let (rates, ht, vht, he) = parse_capabilities(subtype, payload);
+        capabilities = Some(CapabilitiesFingerprint {
+            supported_rates: rates,
+            has_ht: ht,
+            has_vht: vht,
+            has_he: he,
+            beacon_interval: parse_beacon_interval(subtype, payload),
+        });
     }
 
     Some(ParsedFrame {
@@ -459,6 +613,8 @@ fn parse_radiotap_and_frame(data: &[u8]) -> Option<ParsedFrame<'_>> {
         signal_dbm,
         ssid,
         channel,
+        rsn,
+        capabilities,
     })
 }
 
@@ -512,9 +668,10 @@ fn radiotap_signal(data: &[u8]) -> Option<SignalInfo> {
             5 => {
                 if offset < rt_len && rt_len <= data.len() && offset < data.len() {
                     let sig = data.get(offset).copied().map(|b| b as i8);
+                    let dbm = sig.filter(|v| *v != 0);
                     return Some(SignalInfo {
-                        gain: sig.map(dbm_to_gain).unwrap_or(1.0),
-                        dbm: sig,
+                        gain: dbm.map(dbm_to_gain).unwrap_or(1.0),
+                        dbm,
                         channel,
                     });
                 }

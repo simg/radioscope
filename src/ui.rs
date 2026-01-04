@@ -83,6 +83,18 @@ body, html {
 .device-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 8px; }
 .device-card { display: flex; gap: 10px; align-items: flex-start; padding: 8px 10px; border-radius: 12px; border: 1px solid #1f2230; background: #0f1218; min-height: 48px; }
 .device-card input { width: 16px; height: 16px; margin-top: 2px; }
+.evil-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; }
+.evil-card { display: flex; flex-direction: column; gap: 8px; padding: 12px; border-radius: 12px; border: 1px solid #1f2230; background: #0f1218; }
+.evil-meta { display: flex; flex-wrap: wrap; gap: 8px; color: #8f98ac; font-size: 11px; }
+.evil-title { margin: 0; font-size: 14px; color: #e9ecf5; letter-spacing: 0.3px; display: flex; gap: 8px; align-items: center; }
+.evil-trust { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #c5cee3; }
+.evil-events { display: flex; flex-direction: column; gap: 8px; }
+.evil-event { display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border-radius: 10px; background: #10141d; border: 1px solid #1f2230; }
+.sev { padding: 4px 8px; border-radius: 8px; font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; }
+.sev-info { background: #1b2435; color: #c5cee3; border: 1px solid #263047; }
+.sev-warning { background: #2b1f10; color: #ffb672; border: 1px solid #4a2d0c; }
+.sev-high { background: #331518; color: #ff8ea2; border: 1px solid #4a1e27; }
+.sev-critical { background: #3a0f0f; color: #ff6a7c; border: 1px solid #5a1d1d; box-shadow: 0 0 0 1px rgba(255,106,124,0.18); }
 .device-body { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 0; }
 .device-mac { font-weight: 700; font-size: 13px; color: #f0f2fb; letter-spacing: 0.3px; }
 .device-meta { display: flex; flex-wrap: wrap; gap: 8px; font-size: 11px; color: #8f98ac; }
@@ -145,12 +157,20 @@ body, html {
   const deviceSelectAll = document.getElementById('devices-select-all');
   const deviceDeselectAll = document.getElementById('devices-deselect-all');
   const deviceReset = document.getElementById('devices-reset');
+  const evilList = document.getElementById('evil-list');
+  const evilEvents = document.getElementById('evil-events');
+  const evilStatus = document.getElementById('evil-status');
+  const evilWindow = document.getElementById('evil-window');
+  const evilRefresh = document.getElementById('evil-refresh');
+  let evilWs;
   let ws;
   let deviceWs;
   let settingsWs;
   let audioCtx;
   let packetsState = [];
   let devicesState = [];
+  let evilAps = [];
+  let evilEventState = [];
 
   function setSection(target) {
     sections.forEach((section) => {
@@ -164,6 +184,10 @@ body, html {
     if (target === 'devices') {
       fetchDevices();
       ensureDeviceSocket();
+    }
+    if (target === 'evil') {
+      fetchEvilTwin();
+      ensureEvilSocket();
     }
   }
 
@@ -511,6 +535,215 @@ body, html {
     setDeviceFilter(toggles, false);
   }
 
+  function evilWindowSeconds() {
+    const val = parseInt(evilWindow?.value || '10', 10) || 10;
+    const clamped = Math.max(1, Math.min(120, val));
+    if (evilWindow) evilWindow.value = clamped;
+    return clamped * 60;
+  }
+
+  function severityBadge(severity) {
+    switch ((severity || '').toLowerCase()) {
+      case 'critical':
+        return 'sev sev-critical';
+      case 'high':
+        return 'sev sev-high';
+      case 'warning':
+        return 'sev sev-warning';
+      default:
+        return 'sev sev-info';
+    }
+  }
+
+  function renderEvilAps(list) {
+    if (!evilList) return;
+    evilList.innerHTML = '';
+    if (!list.length) {
+      const msg = document.createElement('div');
+      msg.className = 'caption';
+      msg.textContent = 'No APs yet in this window.';
+      evilList.appendChild(msg);
+      return;
+    }
+    const grid = document.createElement('div');
+    grid.className = 'evil-grid';
+    list.forEach((ap) => {
+      const card = document.createElement('div');
+      card.className = 'evil-card';
+      const title = document.createElement('div');
+      title.className = 'evil-title';
+      title.textContent = ap.ssid || '<hidden>';
+      const trustWrap = document.createElement('label');
+      trustWrap.className = 'evil-trust';
+      const trust = document.createElement('input');
+      trust.type = 'checkbox';
+      trust.checked = !!ap.trusted;
+      trust.addEventListener('change', () =>
+        toggleTrust(ap.bssid, ap.ssid, trust.checked)
+      );
+      const trustLabel = document.createElement('span');
+      trustLabel.textContent = 'Trust';
+      trustWrap.appendChild(trust);
+      trustWrap.appendChild(trustLabel);
+      title.appendChild(trustWrap);
+      const meta = document.createElement('div');
+      meta.className = 'evil-meta';
+      meta.innerHTML = `
+        <span>BSSID: ${ap.bssid}</span>
+        <span>Channel: ${ap.channel || '-'}</span>
+        <span>RSSI: ${ap.rssi ?? '-'} dBm</span>
+        <span>Vendor: ${ap.vendor_oui || '-'}</span>
+        <span>Last seen: ${ap.last_seen_ms ? Math.round(ap.last_seen_ms / 1000) + 's ago' : 'n/a'}</span>
+      `;
+      const caps = document.createElement('div');
+      caps.className = 'caption';
+      caps.textContent = `Fingerprint: ${ap.capabilities_fingerprint || 'n/a'}`;
+      card.appendChild(title);
+      card.appendChild(meta);
+      card.appendChild(caps);
+      grid.appendChild(card);
+    });
+    evilList.appendChild(grid);
+  }
+
+  function renderEvilEvents(list) {
+    if (!evilEvents) return;
+    evilEvents.innerHTML = '';
+    if (!list.length) {
+      const msg = document.createElement('div');
+      msg.className = 'caption';
+      msg.textContent = 'No detection events yet.';
+      evilEvents.appendChild(msg);
+      return;
+    }
+    list.slice(0, 50).forEach((evt) => {
+      const wrap = document.createElement('div');
+      wrap.className = 'evil-event';
+      const head = document.createElement('div');
+      head.style.display = 'flex';
+      head.style.gap = '8px';
+      head.style.alignItems = 'center';
+      const sev = document.createElement('span');
+      sev.className = severityBadge(evt.severity);
+      sev.textContent = evt.severity;
+      const title = document.createElement('div');
+      title.textContent = `${evt.ssid} (${evt.bssid})`;
+      head.appendChild(sev);
+      head.appendChild(title);
+      const body = document.createElement('div');
+      body.textContent = evt.message || 'Event';
+      const meta = document.createElement('div');
+      meta.className = 'evil-meta';
+      const ts = evt.timestamp_ms ? new Date(evt.timestamp_ms).toLocaleTimeString() : '';
+      const reasons = Array.isArray(evt.reasons) && evt.reasons.length
+        ? `<span>Reasons: ${evt.reasons.join('; ')}</span>`
+        : '';
+      meta.innerHTML = `<span>Score: ${evt.score}</span><span>Channel: ${evt.channel || '-'}</span><span>RSSI: ${evt.rssi ?? '-'}</span><span>${ts}</span>${reasons}`;
+      wrap.appendChild(head);
+      wrap.appendChild(body);
+      wrap.appendChild(meta);
+      evilEvents.appendChild(wrap);
+    });
+  }
+
+  function pushEvilEvent(evt) {
+    evilEventState.unshift(evt);
+    evilEventState = evilEventState.slice(0, 200);
+    renderEvilEvents(evilEventState);
+  }
+
+  async function fetchEvilTwin() {
+    if (!evilList) return;
+    const windowSeconds = evilWindowSeconds();
+    evilStatus.textContent = 'Loading APs...';
+    try {
+      const res = await fetch(`/api/evil-twin?window_minutes=${windowSeconds / 60}`);
+      if (!res.ok) throw new Error('evil twin fetch failed');
+      const data = await res.json();
+      evilAps = data.aps || [];
+      evilEventState = data.events || [];
+      renderEvilAps(evilAps);
+      renderEvilEvents(evilEventState);
+      evilStatus.textContent = evilAps.length ? '' : 'No APs yet in this window';
+      if (evilWindow && data.window_seconds) {
+        evilWindow.value = Math.round((data.window_seconds || 600) / 60);
+      }
+    } catch (err) {
+      evilStatus.textContent = 'Unable to load Evil Twin data';
+    }
+  }
+
+  function openEvilSocket() {
+    const windowSeconds = evilWindowSeconds();
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    evilStatus.textContent = 'Connecting...';
+    evilWs = new WebSocket(`${proto}://${location.host}/ws/evil?window_minutes=${windowSeconds / 60}`);
+    evilWs.onmessage = (evt) => {
+      try {
+        const data = JSON.parse(evt.data);
+        if (data && data.aps && data.events) {
+          evilAps = data.aps || [];
+          evilEventState = data.events || [];
+          renderEvilAps(evilAps);
+          renderEvilEvents(evilEventState);
+          evilStatus.textContent = evilAps.length ? '' : 'No APs yet in this window';
+          if (evilWindow && data.window_seconds) {
+            evilWindow.value = Math.round((data.window_seconds || 600) / 60);
+          }
+          return;
+        }
+        if (data && data.bssid) {
+          pushEvilEvent(data);
+          evilStatus.textContent = '';
+          if (webUi?.checked) {
+            const sev = (data.severity || '').toLowerCase();
+            const map = {
+              critical: 'evil-critical',
+              high: 'evil-high',
+              warning: 'evil-warning',
+              info: 'evil-info'
+            };
+            playEventSound(map[sev] || 'evil-warning', false, 1.2);
+          }
+        }
+      } catch (err) {
+        evilStatus.textContent = 'Failed to parse Evil Twin update';
+      }
+    };
+    evilWs.onerror = () => evilWs && evilWs.close();
+    evilWs.onclose = () => {
+      if (!evilWs) return;
+      evilStatus.textContent = 'Reconnecting...';
+      setTimeout(() => {
+        evilWs = null;
+        openEvilSocket();
+      }, 2000);
+    };
+  }
+
+  function ensureEvilSocket() {
+    if (evilWs && (evilWs.readyState === WebSocket.OPEN || evilWs.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+    openEvilSocket();
+  }
+
+  async function toggleTrust(bssid, ssid, trust) {
+    evilStatus.textContent = trust ? 'Trusting AP...' : 'Removing trust...';
+    try {
+      const res = await fetch('/api/evil-twin/trust', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bssid, ssid, trust }),
+      });
+      if (!res.ok) throw new Error('trust update failed');
+      fetchEvilTwin();
+      evilStatus.textContent = trust ? 'Trusted' : 'Removed trust';
+    } catch (err) {
+      evilStatus.textContent = 'Unable to update trust list';
+    }
+  }
+
   async function updateSound() {
     soundStatus.textContent = 'Saving sound preferences...';
     if (volumeInput && volumeInput.value.trim() === '') {
@@ -699,6 +932,10 @@ body, html {
       // ACK preview stays louder/lower-pitched but slightly reduced to match backend.
       'ack': { freq: 1400, dur: 0.07, vol: 0.45 },
       'data-tick': { freq: 820, dur: 0.038, vol: 0.22 },
+      'evil-info': { seq: [840, 720], dur: 0.16, vol: 0.7 },
+      'evil-warning': { seq: [840, 720], dur: 0.16, vol: 0.7 },
+      'evil-high': { seq: [840, 720], dur: 0.16, vol: 0.7 },
+      'evil-critical': { seq: [840, 720], dur: 0.16, vol: 0.7 },
     };
     const entry = palette[kind] || palette['data-tick'];
     const effectiveVolume = typeof volumePercent === 'number' ? volumePercent : 0;
@@ -832,11 +1069,14 @@ body, html {
       deviceStatus.textContent = 'Failed to reset counts';
     }
   });
+  evilRefresh?.addEventListener('click', fetchEvilTwin);
 
   fetchSettings();
   fetchDevices();
+  fetchEvilTwin();
   ensureSettingsSocket();
   ensureDeviceSocket();
+  ensureEvilSocket();
   setSection('channels');
 })();
 "#;
@@ -855,6 +1095,7 @@ body, html {
                     button { class: "nav-btn", "data-target": "devices", "Devices" }
                     button { class: "nav-btn", "data-target": "packets", "Packet Types" }
                     button { class: "nav-btn", "data-target": "sound", "Sound" }
+                    button { class: "nav-btn", "data-target": "evil", "Evil Twin" }
                     button { class: "nav-btn", "data-target": "system", "System" }
                 }
                 div { class: "content",
@@ -930,6 +1171,21 @@ body, html {
                         }
                         p { class: "caption", "When Web UI is on, ticks play in your browser via WebSocket notifications." }
                         div { id: "sound-status", class: "status" }
+                    }
+                    div { id: "section-evil", class: "card section", "data-section": "evil",
+                        h2 { class: "card-title", "Evil Twin Detection" }
+                        p { class: "muted", "Trusted APs and detections in the current window." }
+                        div { class: "device-controls",
+                            label { class: "device-window",
+                                span { "Window (min)" }
+                                input { id: "evil-window", r#type: "number", min: "1", max: "120", value: "10" }
+                            }
+                            button { id: "evil-refresh", class: "pill-btn", "Refresh" }
+                        }
+                        div { id: "evil-list", class: "device-groups" }
+                        h3 { class: "card-title", "Detection events" }
+                        div { id: "evil-events", class: "evil-events" }
+                        div { id: "evil-status", class: "status" }
                     }
                     div { id: "section-system", class: "card section", "data-section": "system",
                         h2 { class: "card-title", "System" }

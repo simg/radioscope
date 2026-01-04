@@ -2,6 +2,7 @@ mod audio;
 mod config;
 mod devices;
 mod events;
+mod evil_twin;
 mod settings;
 mod sniffer;
 mod ui;
@@ -11,6 +12,7 @@ use crate::audio::AudioEngine;
 use crate::config::AppConfig;
 use crate::devices::DeviceTracker;
 use crate::events::{EventKind, EventSettings, EventWindow, NoiseMode, PacketEvent, RateLimiter};
+use crate::evil_twin::{ApObservation, EvilSeverity, EvilTwinMonitor};
 use crate::settings::SettingsStore;
 use crate::web::{AppState, ChannelController};
 use anyhow::Result;
@@ -40,6 +42,7 @@ async fn main() -> Result<()> {
     let volume_percent = Arc::new(AtomicU32::new(25));
     let (packet_notifier_tx, _) = broadcast::channel(64);
     let (settings_tx, _) = broadcast::channel(16);
+    let (evil_notifier_tx, _) = broadcast::channel(64);
     let channel_controller = ChannelController::new(config.monitor_interface.clone());
     let channels_24 = Arc::new(tokio::sync::RwLock::new(Vec::new()));
     let channels_5 = Arc::new(tokio::sync::RwLock::new(Vec::new()));
@@ -66,10 +69,13 @@ async fn main() -> Result<()> {
     }
 
     let (packet_tx, mut packet_rx) = mpsc::unbounded_channel::<PacketEvent>();
+    let (ap_tx, mut ap_rx) = mpsc::unbounded_channel::<ApObservation>();
+    let evil_monitor = Arc::new(EvilTwinMonitor::new(settings_store.clone()).await?);
     let _sniffer_thread = sniffer::spawn_sniffer(
         config.monitor_interface.clone(),
         packet_tx,
         Arc::clone(&device_tracker),
+        ap_tx,
     );
 
     let audio_task_handle = audio_handle.clone();
@@ -138,6 +144,56 @@ async fn main() -> Result<()> {
         }
     });
 
+    let monitor_task_handle = audio_handle.clone();
+    let monitor_audio_flag = audio_enabled.clone();
+    let monitor_volume_flag = volume_percent.clone();
+    let monitor = evil_monitor.clone();
+    let monitor_tx = evil_notifier_tx.clone();
+    let monitor_task = tokio::spawn(async move {
+        while let Some(obs) = ap_rx.recv().await {
+            if let Some(event) = monitor.observe(obs).await {
+                match event.severity {
+                    EvilSeverity::Critical => tracing::error!(
+                        "[EvilTwin] {} {} score={} msg={}",
+                        event.ssid,
+                        event.bssid,
+                        event.score,
+                        event.message
+                    ),
+                    EvilSeverity::High => tracing::warn!(
+                        "[EvilTwin] {} {} score={} msg={}",
+                        event.ssid,
+                        event.bssid,
+                        event.score,
+                        event.message
+                    ),
+                    EvilSeverity::Warning => tracing::info!(
+                        "[EvilTwin] {} {} score={} msg={}",
+                        event.ssid,
+                        event.bssid,
+                        event.score,
+                        event.message
+                    ),
+                    EvilSeverity::Info => tracing::debug!(
+                        "[EvilTwin] {} {} score={} msg={}",
+                        event.ssid,
+                        event.bssid,
+                        event.score,
+                        event.message
+                    ),
+                }
+                let _ = monitor_tx.send(event.clone());
+                if monitor_audio_flag.load(Ordering::Relaxed) {
+                    let gain = (monitor_volume_flag.load(Ordering::Relaxed) as f32 / 100.0
+                        * 12.0)
+                        .clamp(0.0, 12.0)
+                        * 1.2;
+                    monitor_task_handle.play(sound_for_severity(&event.severity), false, gain);
+                }
+            }
+        }
+    });
+
     let state = AppState {
         config: config.clone(),
         audio_enabled,
@@ -152,11 +208,14 @@ async fn main() -> Result<()> {
         device_tracker,
         settings_store,
         settings_tx,
+        evil_monitor,
+        evil_tx: evil_notifier_tx,
     };
 
     web::serve(state).await?;
 
     audio_task.abort();
+    monitor_task.abort();
     Ok(())
 }
 
@@ -229,5 +288,15 @@ fn sound_for(kind: &EventKind) -> audio::SoundId {
         EventKind::Cts => CtsKnockback,
         EventKind::Ack => AckClick,
         EventKind::DataTick => DataTick,
+    }
+}
+
+fn sound_for_severity(severity: &EvilSeverity) -> audio::SoundId {
+    use audio::SoundId::*;
+    match severity {
+        EvilSeverity::Critical => EvilCritical,
+        EvilSeverity::High => EvilHigh,
+        EvilSeverity::Warning => EvilWarning,
+        EvilSeverity::Info => EvilInfo,
     }
 }

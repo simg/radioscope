@@ -1,6 +1,8 @@
 use crate::events::{EventKind, EventSettings, NoiseMode};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json;
+use sqlx::Row;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use std::collections::HashMap;
@@ -17,6 +19,16 @@ pub struct UiSettings {
     pub mode: NoiseMode,
     pub events: HashMap<EventKind, bool>,
     pub channel: Option<u16>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TrustedApRecord {
+    pub ssid: String,
+    pub bssid: String,
+    pub rsn_profile_json: Option<String>,
+    pub vendor_oui: Option<String>,
+    pub channels_seen_json: Option<String>,
+    pub capabilities_fingerprint: Option<String>,
 }
 
 impl UiSettings {
@@ -82,6 +94,15 @@ impl SettingsStore {
             INSERT INTO ui_settings (id, audio_jack, web_ui_sound, volume_by_signal, volume_percent, mode, events_json, channel)
             SELECT 1, 1, 0, 0, 25, 'crowded', '{}', NULL
             WHERE NOT EXISTS (SELECT 1 FROM ui_settings WHERE id = 1);
+            CREATE TABLE IF NOT EXISTS trusted_aps (
+                bssid TEXT PRIMARY KEY,
+                ssid TEXT NOT NULL,
+                rsn_profile_json TEXT,
+                vendor_oui TEXT,
+                channels_seen_json TEXT,
+                capabilities_fingerprint TEXT,
+                created_at INTEGER DEFAULT (strftime('%s','now'))
+            );
             ",
         )
         .execute(&pool)
@@ -142,6 +163,63 @@ impl SettingsStore {
         .bind(payload.channel.map(|c| c as i64))
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    pub async fn list_trusted_aps(&self) -> Result<Vec<TrustedApRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT ssid, bssid, rsn_profile_json, vendor_oui, channels_seen_json, capabilities_fingerprint
+            FROM trusted_aps
+            ORDER BY ssid, bssid
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(TrustedApRecord {
+                ssid: row.try_get("ssid")?,
+                bssid: row.try_get("bssid")?,
+                rsn_profile_json: row.try_get("rsn_profile_json")?,
+                vendor_oui: row.try_get("vendor_oui")?,
+                channels_seen_json: row.try_get("channels_seen_json")?,
+                capabilities_fingerprint: row.try_get("capabilities_fingerprint")?,
+            });
+        }
+        Ok(out)
+    }
+
+    pub async fn upsert_trusted_ap(&self, ap: &TrustedApRecord) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO trusted_aps (bssid, ssid, rsn_profile_json, vendor_oui, channels_seen_json, capabilities_fingerprint)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(bssid) DO UPDATE SET
+                ssid=excluded.ssid,
+                rsn_profile_json=excluded.rsn_profile_json,
+                vendor_oui=excluded.vendor_oui,
+                channels_seen_json=excluded.channels_seen_json,
+                capabilities_fingerprint=excluded.capabilities_fingerprint
+            "#,
+        )
+        .bind(&ap.bssid)
+        .bind(&ap.ssid)
+        .bind(&ap.rsn_profile_json)
+        .bind(&ap.vendor_oui)
+        .bind(&ap.channels_seen_json)
+        .bind(&ap.capabilities_fingerprint)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_trusted_ap(&self, bssid: &str) -> Result<()> {
+        sqlx::query("DELETE FROM trusted_aps WHERE bssid = ?")
+            .bind(bssid)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 }

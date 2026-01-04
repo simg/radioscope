@@ -1,6 +1,7 @@
 use crate::config::AppConfig;
 use crate::devices::{self, DeviceTracker};
 use crate::events::{EventKind, EventSettings, NoiseMode, PacketEvent};
+use crate::evil_twin::{ApView, EvilEvent, EvilTwinMonitor};
 use crate::settings::{SettingsStore, UiSettings};
 use crate::ui;
 use anyhow::{Context, Result};
@@ -40,6 +41,8 @@ pub struct AppState {
     pub channels_5: Arc<RwLock<Vec<ChannelInfo>>>,
     pub event_settings: Arc<RwLock<EventSettings>>,
     pub device_tracker: Arc<DeviceTracker>,
+    pub evil_monitor: Arc<EvilTwinMonitor>,
+    pub evil_tx: broadcast::Sender<EvilEvent>,
 }
 
 #[derive(Clone)]
@@ -111,10 +114,13 @@ pub async fn serve(state: AppState) -> Result<()> {
         .route("/api/devices", get(devices))
         .route("/api/device-filters", post(update_device_filters))
         .route("/api/device-reset", post(reset_device_counts))
+        .route("/api/evil-twin", get(evil_twin_snapshot))
+        .route("/api/evil-twin/trust", post(update_trust))
         .route("/api/shutdown", post(shutdown))
         .route("/ws/packets", get(ws_packets))
         .route("/ws/devices", get(ws_devices))
         .route("/ws/settings", get(ws_settings))
+        .route("/ws/evil", get(ws_evil))
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
@@ -205,6 +211,13 @@ struct DevicesResponse {
     devices: Vec<devices::DeviceView>,
 }
 
+#[derive(Serialize)]
+struct EvilTwinResponse {
+    window_seconds: u64,
+    aps: Vec<ApView>,
+    events: Vec<EvilEvent>,
+}
+
 async fn devices(
     State(state): State<AppState>,
     Query(params): Query<DevicesQuery>,
@@ -214,6 +227,22 @@ async fn devices(
     Ok(Json(DevicesResponse {
         window_seconds: window,
         devices: snapshot,
+    }))
+}
+
+async fn evil_twin_snapshot(
+    State(state): State<AppState>,
+    Query(params): Query<DevicesQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let window = window_from_query(&params);
+    let (aps, events) = state
+        .evil_monitor
+        .snapshot(Duration::from_secs(window))
+        .await;
+    Ok(Json(EvilTwinResponse {
+        window_seconds: window,
+        aps,
+        events,
     }))
 }
 
@@ -386,6 +415,19 @@ struct DeviceFilterResponse {
     updated: usize,
 }
 
+#[derive(Deserialize)]
+struct TrustRequest {
+    bssid: String,
+    ssid: Option<String>,
+    trust: bool,
+}
+
+#[derive(Serialize)]
+struct TrustResponse {
+    trusted: bool,
+    bssid: String,
+}
+
 async fn update_device_filters(
     State(state): State<AppState>,
     Json(body): Json<DeviceFilterRequest>,
@@ -404,6 +446,43 @@ async fn update_device_filters(
     state.device_tracker.set_many(&parsed);
     Ok(Json(DeviceFilterResponse {
         updated: parsed.len(),
+    }))
+}
+
+async fn update_trust(
+    State(state): State<AppState>,
+    Json(body): Json<TrustRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if body.trust {
+        let ssid = body
+            .ssid
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, "SSID required to trust".to_string()))?;
+        state
+            .evil_monitor
+            .trust(&ssid, &body.bssid)
+            .await
+            .map_err(|err| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Unable to trust AP: {err}"),
+                )
+            })?;
+    } else {
+        state
+            .evil_monitor
+            .untrust(&body.bssid)
+            .await
+            .map_err(|err| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Unable to untrust AP: {err}"),
+                )
+            })?;
+    }
+
+    Ok(Json(TrustResponse {
+        trusted: body.trust,
+        bssid: body.bssid,
     }))
 }
 
@@ -481,6 +560,10 @@ async fn ws_packets(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl
     ws.on_upgrade(move |socket| handle_ws(socket, state))
 }
 
+async fn ws_evil(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_ws_evil(socket, state))
+}
+
 async fn handle_ws(mut socket: WebSocket, state: AppState) {
     let mut rx = state.packet_tx.subscribe();
     while let Ok(evt) = rx.recv().await {
@@ -513,6 +596,28 @@ async fn handle_ws_settings(mut socket: WebSocket, state: AppState) {
     let mut rx = state.settings_tx.subscribe();
     while let Ok(msg) = rx.recv().await {
         if let Ok(payload) = serde_json::to_string(&msg) {
+            if socket.send(Message::Text(payload.into())).await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
+async fn handle_ws_evil(mut socket: WebSocket, state: AppState) {
+    let (aps, events) = state
+        .evil_monitor
+        .snapshot(Duration::from_secs(600))
+        .await;
+    if let Ok(payload) = serde_json::to_string(&EvilTwinResponse {
+        window_seconds: 600,
+        aps,
+        events,
+    }) {
+        let _ = socket.send(Message::Text(payload.into())).await;
+    }
+    let mut rx = state.evil_tx.subscribe();
+    while let Ok(evt) = rx.recv().await {
+        if let Ok(payload) = serde_json::to_string(&evt) {
             if socket.send(Message::Text(payload.into())).await.is_err() {
                 break;
             }

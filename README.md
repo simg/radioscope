@@ -22,6 +22,16 @@ Under the hood it uses Dioxus SSR for the UI, Axum for the API, `libpcap` for ca
   <a href="screenshots/sample.mp3">Download sample.mp3</a>.
 </audio>
 
+## Evil Twin Detection
+
+Radioscope can watch for Evil Twin behavior by comparing live beacons/associations against a trusted AP roster. When you trust an AP, its SSID, BSSID, RSN profile, vendor OUI, channels, and capability fingerprint are snapshotted; future frames are scored for unknown BSSIDs, fingerprint drift, channel teleporting, downgrades, KARMA behavior, and sudden RSSI spikes. Findings emit a short claxon and are logged to syslog with evidence in the message.
+
+The Evil Twin page shows trusted APs plus anything seen in the current window, with a “Trust” checkbox per entry and a live event feed that lists scores, severities, and concrete reasons (e.g., stored vs seen RSN/cipher suites, channels observed). You can untrust APs here to stop monitoring them. Web UI sound mirrors the backend alert tones when enabled.
+
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;">
+  <img src="screenshots/evil-twin.png" alt="Evil Twin detection view" style="width:100%;height:auto;">
+</div>
+
 ## Components
 
 - Packet capture via `libpcap` (`pcap` crate).
