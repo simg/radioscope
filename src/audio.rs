@@ -135,10 +135,10 @@ fn build_palette(sample_rate: u32) -> SoundPalette {
         EapolMotif,
         build_motif(sample_rate, &[640.0, 760.0, 880.0, 1020.0], 22, 0.12),
     );
-    sounds.insert(RtsKnock, build_tick(sample_rate, 360.0, 20, 0.12));
-    sounds.insert(CtsKnockback, build_tick(sample_rate, 480.0, 20, 0.12));
-    sounds.insert(AckClick, build_tick(sample_rate, 2200.0, 12, 0.04));
-    sounds.insert(DataTick, build_tick(sample_rate, 820.0, 16, 0.07));
+    sounds.insert(RtsKnock, build_tick(sample_rate, 360.0, 24, 0.32));
+    sounds.insert(CtsKnockback, build_tick(sample_rate, 480.0, 24, 0.32));
+    sounds.insert(AckClick, build_ack(sample_rate));
+    sounds.insert(DataTick, build_tick(sample_rate, 820.0, 22, 0.2));
     sounds.insert(RetryGlitch, build_noise(sample_rate, 10, 0.05));
 
     SoundPalette { sounds }
@@ -203,6 +203,17 @@ fn build_noise(sample_rate: u32, duration_ms: u64, volume: f32) -> Vec<f32> {
             (rand::Rng::random::<f32>(&mut rng) * 2.0 - 1.0) * volume * env
         })
         .collect()
+}
+
+fn build_ack(sample_rate: u32) -> Vec<f32> {
+    // Strong, lower pitch click with a bit of noise to cut through.
+    let mut base = build_tick(sample_rate, 1400.0, 40, 1.8);
+    let noise = build_noise(sample_rate, 28, 0.45);
+    let min_len = base.len().min(noise.len());
+    for i in 0..min_len {
+        base[i] += noise[i];
+    }
+    base
 }
 
 fn pop_sample(queue: &Arc<Mutex<VecDeque<f32>>>) -> f32 {

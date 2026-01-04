@@ -288,9 +288,9 @@ body, html {
       play.type = 'button';
       play.className = 'pill-btn';
       play.textContent = 'Play';
-      play.addEventListener('click', (e) => {
+      play.addEventListener('click', async (e) => {
         e.preventDefault();
-        playEventSound(item.id, false);
+        await playEventSound(item.id, false, 1, { preview: true });
       });
       wrap.appendChild(input);
       wrap.appendChild(span);
@@ -666,12 +666,26 @@ body, html {
     playEventSound('data-tick', false, 1);
   }
 
-  function playEventSound(kind, retry, amplitude = 1) {
+  async function ensureAudioCtx() {
     if (!audioCtx) {
       const Ctx = window.AudioContext || window.webkitAudioContext;
-      if (!Ctx) return;
+      if (!Ctx) return null;
       audioCtx = new Ctx();
     }
+    if (audioCtx.state === 'suspended') {
+      try {
+        await audioCtx.resume();
+      } catch {
+        /* ignore */
+      }
+    }
+    return audioCtx;
+  }
+
+  async function playEventSound(kind, retry, amplitude = 1, options = {}) {
+    const preview = !!options.preview;
+    const ctx = await ensureAudioCtx();
+    if (!ctx) return;
     const now = audioCtx.currentTime;
     const palette = {
       'beacon': { freq: 660, dur: 0.04, vol: 0.1 },
@@ -680,13 +694,15 @@ body, html {
       'assoc': { freq: [520, 840], dur: 0.05, vol: 0.14 },
       'deauth': { noise: true, dur: 0.04, vol: 0.2 },
       'eapol': { seq: [640, 760, 880, 1020], dur: 0.03, vol: 0.12 },
-      'rts': { freq: 360, dur: 0.03, vol: 0.12 },
-      'cts': { freq: 480, dur: 0.03, vol: 0.12 },
-      'ack': { freq: 2200, dur: 0.02, vol: 0.05 },
-      'data-tick': { freq: 820, dur: 0.03, vol: 0.09 },
+      'rts': { freq: 360, dur: 0.036, vol: 0.32 },
+      'cts': { freq: 480, dur: 0.036, vol: 0.32 },
+      // ACK preview stays louder/lower-pitched but slightly reduced to match backend.
+      'ack': { freq: 1400, dur: 0.07, vol: 0.45 },
+      'data-tick': { freq: 820, dur: 0.038, vol: 0.22 },
     };
     const entry = palette[kind] || palette['data-tick'];
-    const volScale = Math.max(0, Math.min(12, (volumePercent || 0) / 100 * 12));
+    const effectiveVolume = typeof volumePercent === 'number' ? volumePercent : 0;
+    const volScale = Math.max(0, Math.min(12, (effectiveVolume || 0) / 100 * 12));
     const baseScale = Math.max(0.1, Math.min(1.2, amplitude || 1));
     const gainScale = volScale === 0 ? 0 : baseScale * volScale;
     const gain = audioCtx.createGain();
