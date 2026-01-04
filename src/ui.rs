@@ -147,6 +147,7 @@ body, html {
   const deviceReset = document.getElementById('devices-reset');
   let ws;
   let deviceWs;
+  let settingsWs;
   let audioCtx;
   let packetsState = [];
   let devicesState = [];
@@ -170,34 +171,56 @@ body, html {
     btn.addEventListener('click', () => setSection(btn.dataset.target));
   });
 
+  function applySettingsSnapshot(data, opts = {}) {
+    if (!data || typeof data !== 'object') return;
+    const skipChannels = !!opts.skipChannels;
+    if (!skipChannels) {
+      if (Array.isArray(data.available_channels_24ghz)) {
+        renderChannels(data.available_channels_24ghz || [], channel24);
+      }
+      if (Array.isArray(data.available_channels_5ghz)) {
+        renderChannels(data.available_channels_5ghz || [], channel5);
+      }
+      if (typeof data.channel === 'number') {
+        setActiveChannel(data.channel);
+      }
+    }
+    if (audioJack && data.audio_jack != null) {
+      audioJack.checked = !!data.audio_jack;
+    }
+    if (webUi && data.web_ui_sound != null) {
+      webUi.checked = !!data.web_ui_sound;
+    }
+    if (volumeBySignal && data.volume_by_signal != null) {
+      volumeBySignal.checked = !!data.volume_by_signal;
+    }
+    if (typeof data.volume_percent === 'number') {
+      volumePercent = data.volume_percent;
+      if (volumeInput) {
+        volumeInput.value = String(data.volume_percent);
+      }
+    }
+    if (Array.isArray(data.packet_events)) {
+      packetsState = data.packet_events;
+      renderPackets(packetsState);
+    }
+    if (modeSelect && data.mode) {
+      modeSelect.value = data.mode;
+    }
+    if (data.data_tick_n) {
+      packetStatus.textContent = `Data tick every ${data.data_tick_n} frames (${data.mode || ''})`;
+    }
+    if (webUi) {
+      handleWebUiToggle();
+    }
+  }
+
   async function fetchSettings() {
     try {
       const res = await fetch('/api/settings');
       if (!res.ok) throw new Error('settings failed');
       const data = await res.json();
-      renderChannels(data.available_channels_24ghz || [], channel24);
-      renderChannels(data.available_channels_5ghz || [], channel5);
-      if (typeof data.channel === 'number') {
-        setActiveChannel(data.channel);
-      }
-      audioJack.checked = !!data.audio_jack;
-      webUi.checked = !!data.web_ui_sound;
-      volumeBySignal.checked = !!data.volume_by_signal;
-      if (volumeInput && typeof data.volume_percent === 'number') {
-        volumeInput.value = String(data.volume_percent);
-        volumePercent = data.volume_percent;
-      }
-      packetsState = data.packet_events || [];
-      renderPackets(packetsState);
-      if (modeSelect && data.mode) {
-        modeSelect.value = data.mode;
-      }
-      if (data.data_tick_n) {
-        packetStatus.textContent = `Data tick every ${data.data_tick_n} frames (${data.mode || ''})`;
-      }
-      if (webUi.checked) {
-        ensureWebsocket();
-      }
+      applySettingsSnapshot(data);
     } catch (err) {
       channelStatus.textContent = 'Unable to load settings';
     }
@@ -550,6 +573,57 @@ body, html {
     }
   }
 
+  function handleSettingsMessage(msg) {
+    if (!msg || typeof msg !== 'object') return;
+    if (msg.type === 'full' && msg.settings) {
+      applySettingsSnapshot(msg.settings);
+      return;
+    }
+    if (msg.type === 'sound' && msg.settings) {
+      applySettingsSnapshot(msg.settings, { skipChannels: true });
+      soundStatus.textContent = 'Sound updated elsewhere';
+      return;
+    }
+    if (msg.type === 'events' && msg.settings) {
+      applySettingsSnapshot({
+        packet_events: msg.settings.events,
+        mode: msg.settings.mode,
+        data_tick_n: msg.settings.data_tick_n,
+      }, { skipChannels: true });
+      packetStatus.textContent = 'Packet settings updated elsewhere';
+      return;
+    }
+    if (msg.type === 'channel' && msg.settings && typeof msg.settings.channel === 'number') {
+      setActiveChannel(msg.settings.channel);
+      channelStatus.textContent = `Switched to channel ${msg.settings.channel}`;
+    }
+  }
+
+  function openSettingsSocket() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    settingsWs = new WebSocket(`${proto}://${location.host}/ws/settings`);
+    settingsWs.onmessage = (evt) => {
+      try {
+        const data = JSON.parse(evt.data);
+        handleSettingsMessage(data);
+      } catch {
+        /* ignore */
+      }
+    };
+    settingsWs.onerror = () => settingsWs && settingsWs.close();
+    settingsWs.onclose = () => {
+      settingsWs = null;
+      setTimeout(ensureSettingsSocket, 1500);
+    };
+  }
+
+  function ensureSettingsSocket() {
+    if (settingsWs && (settingsWs.readyState === WebSocket.OPEN || settingsWs.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+    openSettingsSocket();
+  }
+
   function handleWebUiToggle() {
     if (webUi.checked) {
       ensureWebsocket();
@@ -745,6 +819,7 @@ body, html {
 
   fetchSettings();
   fetchDevices();
+  ensureSettingsSocket();
   ensureDeviceSocket();
   setSection('channels');
 })();

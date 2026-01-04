@@ -8,7 +8,9 @@ Type=simple
 User=root
 Environment=MONITOR_INTERFACE=wlan1mon
 Environment=HTTP_BIND=0.0.0.0:8080
+Environment=DB_PATH=/var/lib/radioscope/radioscope.sqlite
 ExecStart=/usr/local/bin/radioscope
+ExecStartPre=/bin/mkdir -p /var/lib/radioscope
 Restart=on-failure
 RestartSec=2s
 

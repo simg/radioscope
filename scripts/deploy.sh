@@ -30,6 +30,7 @@ ssh ${SSH_OPTS} "${PI_USER}@${PI_HOST}" <<EOF
 set -e
 sudo mv ${REMOTE_DIR}/radioscope /usr/local/bin/radioscope
 sudo mv ${REMOTE_DIR}/radioscope.service /etc/systemd/system/radioscope.service
+sudo mkdir -p /var/lib/radioscope
 sudo systemctl daemon-reload
 sudo systemctl enable radioscope.service
 sudo systemctl restart radioscope.service

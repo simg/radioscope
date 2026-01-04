@@ -1,6 +1,7 @@
 use crate::config::AppConfig;
 use crate::devices::{self, DeviceTracker};
 use crate::events::{EventKind, EventSettings, NoiseMode, PacketEvent};
+use crate::settings::{SettingsStore, UiSettings};
 use crate::ui;
 use anyhow::{Context, Result};
 use axum::extract::ws::{Message, WebSocket};
@@ -32,6 +33,8 @@ pub struct AppState {
     pub volume_by_signal: Arc<AtomicBool>,
     pub volume_percent: Arc<AtomicU32>,
     pub packet_tx: broadcast::Sender<PacketEvent>,
+    pub settings_tx: broadcast::Sender<SettingsBroadcast>,
+    pub settings_store: SettingsStore,
     pub channel: ChannelController,
     pub channels_24: Arc<RwLock<Vec<ChannelInfo>>>,
     pub channels_5: Arc<RwLock<Vec<ChannelInfo>>>,
@@ -72,6 +75,15 @@ impl ChannelController {
     }
 }
 
+#[derive(Clone, Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub(crate) enum SettingsBroadcast {
+    Full { settings: SettingsResponse },
+    Sound { settings: SoundResponse },
+    Events { settings: EventsResponse },
+    Channel { settings: ChannelResponse },
+}
+
 pub async fn serve(state: AppState) -> Result<()> {
     {
         let iface = state.config.monitor_interface.clone();
@@ -102,6 +114,7 @@ pub async fn serve(state: AppState) -> Result<()> {
         .route("/api/shutdown", post(shutdown))
         .route("/ws/packets", get(ws_packets))
         .route("/ws/devices", get(ws_devices))
+        .route("/ws/settings", get(ws_settings))
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
@@ -131,15 +144,15 @@ pub struct ChannelInfo {
     enabled: bool,
 }
 
-#[derive(Serialize)]
-struct EventToggle {
+#[derive(Serialize, Clone)]
+pub(crate) struct EventToggle {
     id: EventKind,
     label: &'static str,
     enabled: bool,
 }
 
-#[derive(Serialize)]
-struct SettingsResponse {
+#[derive(Serialize, Clone)]
+pub(crate) struct SettingsResponse {
     monitor_interface: String,
     channel: Option<u16>,
     audio_jack: bool,
@@ -153,15 +166,13 @@ struct SettingsResponse {
     data_tick_n: u32,
 }
 
-async fn settings(
-    State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+async fn build_settings_response(state: &AppState) -> SettingsResponse {
     let channel = state.channel.current().await;
     let channels_24 = state.channels_24.read().await.clone();
     let channels_5 = state.channels_5.read().await.clone();
     let event_settings = state.event_settings.read().await.clone();
     let toggles = all_event_toggles(&event_settings);
-    Ok(Json(SettingsResponse {
+    SettingsResponse {
         monitor_interface: state.config.monitor_interface.clone(),
         channel,
         audio_jack: state.audio_enabled.load(Ordering::Relaxed),
@@ -173,7 +184,13 @@ async fn settings(
         packet_events: toggles,
         mode: event_settings.mode.clone(),
         data_tick_n: data_tick_for(&event_settings.mode),
-    }))
+    }
+}
+
+async fn settings(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    Ok(Json(build_settings_response(&state).await))
 }
 
 #[derive(Deserialize)]
@@ -216,8 +233,8 @@ struct ChannelRequest {
     channel: u16,
 }
 
-#[derive(Serialize)]
-struct ChannelResponse {
+#[derive(Serialize, Clone)]
+pub(crate) struct ChannelResponse {
     channel: u16,
 }
 
@@ -236,6 +253,14 @@ async fn set_channel(
             )
         })?;
 
+    persist_ui_settings(&state, Some(channel)).await?;
+    notify_settings(
+        &state,
+        SettingsBroadcast::Channel {
+            settings: ChannelResponse { channel },
+        },
+    );
+
     tracing::info!("Monitor interface set to channel {channel}");
     Ok(Json(ChannelResponse { channel }))
 }
@@ -248,8 +273,8 @@ struct UpdateSoundRequest {
     volume_percent: Option<u32>,
 }
 
-#[derive(Serialize)]
-struct SoundResponse {
+#[derive(Serialize, Clone)]
+pub(crate) struct SoundResponse {
     audio_jack: bool,
     web_ui_sound: bool,
     volume_by_signal: bool,
@@ -274,16 +299,26 @@ async fn update_sound(
         state.volume_percent.store(clamped, Ordering::Relaxed);
     }
 
-    Ok(Json(SoundResponse {
+    let response = SoundResponse {
         audio_jack: state.audio_enabled.load(Ordering::Relaxed),
         web_ui_sound: state.web_sound_enabled.load(Ordering::Relaxed),
         volume_by_signal: state.volume_by_signal.load(Ordering::Relaxed),
         volume_percent: state.volume_percent.load(Ordering::Relaxed),
-    }))
+    };
+
+    persist_ui_settings(&state, None).await?;
+    notify_settings(
+        &state,
+        SettingsBroadcast::Sound {
+            settings: response.clone(),
+        },
+    );
+
+    Ok(Json(response))
 }
 
-#[derive(Serialize)]
-struct EventsResponse {
+#[derive(Serialize, Clone)]
+pub(crate) struct EventsResponse {
     mode: NoiseMode,
     data_tick_n: u32,
     events: Vec<EventToggle>,
@@ -324,7 +359,15 @@ async fn update_events(
         }
         settings.clone()
     };
-    Ok(Json(build_events_response(&updated)))
+    persist_ui_settings(&state, None).await?;
+    let response = build_events_response(&updated);
+    notify_settings(
+        &state,
+        SettingsBroadcast::Events {
+            settings: response.clone(),
+        },
+    );
+    Ok(Json(response))
 }
 
 #[derive(Deserialize)]
@@ -430,6 +473,10 @@ async fn ws_devices(
     ws.on_upgrade(move |socket| handle_ws_devices(socket, state, window))
 }
 
+async fn ws_settings(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_ws_settings(socket, state))
+}
+
 async fn ws_packets(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_ws(socket, state))
 }
@@ -450,6 +497,25 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
         };
         if socket.send(Message::Text(payload.into())).await.is_err() {
             break;
+        }
+    }
+}
+
+async fn handle_ws_settings(mut socket: WebSocket, state: AppState) {
+    if let Ok(payload) = serde_json::to_string(&SettingsBroadcast::Full {
+        settings: build_settings_response(&state).await,
+    }) {
+        if socket.send(Message::Text(payload.into())).await.is_err() {
+            return;
+        }
+    }
+
+    let mut rx = state.settings_tx.subscribe();
+    while let Ok(msg) = rx.recv().await {
+        if let Ok(payload) = serde_json::to_string(&msg) {
+            if socket.send(Message::Text(payload.into())).await.is_err() {
+                break;
+            }
         }
     }
 }
@@ -660,6 +726,40 @@ fn build_events_response(settings: &EventSettings) -> EventsResponse {
         data_tick_n: data_tick_for(&settings.mode),
         events: all_event_toggles(settings),
     }
+}
+
+async fn ui_settings_snapshot(state: &AppState, channel_override: Option<u16>) -> UiSettings {
+    let channel = if let Some(ch) = channel_override {
+        Some(ch)
+    } else {
+        state.channel.current().await
+    };
+    let events = state.event_settings.read().await.clone();
+    UiSettings::from_event_settings(
+        state.audio_enabled.load(Ordering::Relaxed),
+        state.web_sound_enabled.load(Ordering::Relaxed),
+        state.volume_by_signal.load(Ordering::Relaxed),
+        state.volume_percent.load(Ordering::Relaxed),
+        &events,
+        channel,
+    )
+}
+
+async fn persist_ui_settings(
+    state: &AppState,
+    channel_override: Option<u16>,
+) -> Result<(), (StatusCode, String)> {
+    let snapshot = ui_settings_snapshot(state, channel_override).await;
+    state.settings_store.save(&snapshot).await.map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to persist settings: {err}"),
+        )
+    })
+}
+
+fn notify_settings(state: &AppState, msg: SettingsBroadcast) {
+    let _ = state.settings_tx.send(msg);
 }
 
 async fn detect_phy(interface: &str) -> Result<String> {

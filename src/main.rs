@@ -2,6 +2,7 @@ mod audio;
 mod config;
 mod devices;
 mod events;
+mod settings;
 mod sniffer;
 mod ui;
 mod web;
@@ -10,6 +11,7 @@ use crate::audio::AudioEngine;
 use crate::config::AppConfig;
 use crate::devices::DeviceTracker;
 use crate::events::{EventKind, EventSettings, EventWindow, NoiseMode, PacketEvent, RateLimiter};
+use crate::settings::SettingsStore;
 use crate::web::{AppState, ChannelController};
 use anyhow::Result;
 use std::sync::Arc;
@@ -37,14 +39,30 @@ async fn main() -> Result<()> {
     let volume_by_signal = Arc::new(AtomicBool::new(false));
     let volume_percent = Arc::new(AtomicU32::new(25));
     let (packet_notifier_tx, _) = broadcast::channel(64);
+    let (settings_tx, _) = broadcast::channel(16);
     let channel_controller = ChannelController::new(config.monitor_interface.clone());
     let channels_24 = Arc::new(tokio::sync::RwLock::new(Vec::new()));
     let channels_5 = Arc::new(tokio::sync::RwLock::new(Vec::new()));
     let event_settings = Arc::new(tokio::sync::RwLock::new(EventSettings::default()));
     let device_tracker = Arc::new(DeviceTracker::new());
+    let settings_store = SettingsStore::connect(config.db_path.clone()).await?;
 
     if let Err(err) = channel_controller.refresh_current().await {
         tracing::warn!("Unable to read initial channel: {err:?}");
+    }
+
+    if let Err(err) = apply_persisted_settings(
+        &settings_store,
+        &audio_enabled,
+        &web_sound_enabled,
+        &volume_by_signal,
+        &volume_percent,
+        &event_settings,
+        &channel_controller,
+    )
+    .await
+    {
+        tracing::warn!("Unable to load persisted settings: {err:?}");
     }
 
     let (packet_tx, mut packet_rx) = mpsc::unbounded_channel::<PacketEvent>();
@@ -132,6 +150,8 @@ async fn main() -> Result<()> {
         channels_5,
         event_settings,
         device_tracker,
+        settings_store,
+        settings_tx,
     };
 
     web::serve(state).await?;
@@ -144,6 +164,39 @@ fn init_tracing() {
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,tower_http=info"));
     let _ = fmt().with_env_filter(env_filter).try_init();
+}
+
+async fn apply_persisted_settings(
+    store: &SettingsStore,
+    audio_enabled: &Arc<AtomicBool>,
+    web_sound_enabled: &Arc<AtomicBool>,
+    volume_by_signal: &Arc<AtomicBool>,
+    volume_percent: &Arc<AtomicU32>,
+    event_settings: &Arc<tokio::sync::RwLock<EventSettings>>,
+    channel_controller: &ChannelController,
+) -> Result<()> {
+    let saved = store.load().await?;
+    audio_enabled.store(saved.audio_jack, Ordering::Relaxed);
+    web_sound_enabled.store(saved.web_ui_sound, Ordering::Relaxed);
+    volume_by_signal.store(saved.volume_by_signal, Ordering::Relaxed);
+    volume_percent.store(saved.volume_percent.clamp(0, 100), Ordering::Relaxed);
+
+    {
+        let mut guard = event_settings.write().await;
+        let mut merged = EventSettings::default();
+        merged.mode = saved.mode.clone();
+        for (kind, enabled) in saved.events.iter() {
+            merged.enabled.insert(kind.clone(), *enabled);
+        }
+        *guard = merged;
+    }
+
+    if let Some(ch) = saved.channel {
+        if let Err(err) = channel_controller.set_channel(ch).await {
+            tracing::warn!("Failed to apply persisted channel {ch}: {err:?}");
+        }
+    }
+    Ok(())
 }
 
 fn min_interval_for(kind: &EventKind, mode: &NoiseMode) -> Duration {
