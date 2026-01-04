@@ -55,6 +55,9 @@ body, html {
 .channel-btn:disabled { opacity: 0.6; cursor: not-allowed; }
 .channel-btn.disabled { opacity: 0.35; filter: blur(0.3px); border-style: dashed; cursor: not-allowed; }
 .sound-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.volume-field { display: flex; flex-direction: column; gap: 8px; padding: 12px; background: #10141d; border: 1px solid #1f2230; border-radius: 12px; }
+.volume-field label { font-weight: 700; color: #dfe4f3; font-size: 14px; letter-spacing: 0.2px; }
+.volume-field input { max-width: 140px; padding: 10px 12px; border-radius: 10px; border: 1px solid #262b38; background: #0f1118; color: #e9ecf5; font-weight: 700; }
 .checkbox { display: flex; align-items: center; gap: 10px; padding: 12px; background: #10141d; border: 1px solid #1f2230; border-radius: 12px; cursor: pointer; }
 .checkbox input { width: 18px; height: 18px; }
 .primary { width: 100%; padding: 14px 16px; border-radius: 12px; border: none; background: linear-gradient(135deg, #ff5f7a, #ff3c5a); color: #0b0d12; font-weight: 800; font-size: 16px; letter-spacing: 0.3px; box-shadow: 0 12px 30px rgba(255,79,100,0.35); transition: transform 120ms ease, box-shadow 120ms ease, filter 120ms ease; cursor: pointer; }
@@ -124,6 +127,8 @@ body, html {
   const audioJack = document.getElementById('audio-jack');
   const webUi = document.getElementById('web-ui');
   const volumeBySignal = document.getElementById('volume-by-signal');
+  const volumeInput = document.getElementById('volume-input');
+  let volumePercent = 25;
   const packetList = document.getElementById('packet-list');
   const packetStatus = document.getElementById('packet-status');
   const modeSelect = document.getElementById('mode-select');
@@ -178,6 +183,10 @@ body, html {
       audioJack.checked = !!data.audio_jack;
       webUi.checked = !!data.web_ui_sound;
       volumeBySignal.checked = !!data.volume_by_signal;
+      if (volumeInput && typeof data.volume_percent === 'number') {
+        volumeInput.value = String(data.volume_percent);
+        volumePercent = data.volume_percent;
+      }
       packetsState = data.packet_events || [];
       renderPackets(packetsState);
       if (modeSelect && data.mode) {
@@ -481,6 +490,18 @@ body, html {
 
   async function updateSound() {
     soundStatus.textContent = 'Saving sound preferences...';
+    if (volumeInput && volumeInput.value.trim() === '') {
+      // Let the user finish typing; don't auto-reset.
+      soundStatus.textContent = '';
+      return;
+    }
+    const volumeRaw = volumeInput ? parseInt(volumeInput.value, 10) : NaN;
+    const newVolumePercent = Number.isFinite(volumeRaw)
+      ? Math.min(100, Math.max(0, volumeRaw))
+      : volumePercent;
+    if (volumeInput) {
+      volumeInput.value = String(volumePercent);
+    }
     try {
       const res = await fetch('/api/sound', {
         method: 'POST',
@@ -489,12 +510,19 @@ body, html {
           audio_jack: audioJack.checked,
           web_ui: webUi.checked,
           volume_by_signal: volumeBySignal.checked,
+          volume_percent: newVolumePercent,
         }),
       });
       if (!res.ok) throw new Error('sound update failed');
       const data = await res.json();
       audioJack.checked = !!data.audio_jack;
       webUi.checked = !!data.web_ui_sound;
+      if (typeof data.volume_percent === 'number') {
+        volumePercent = data.volume_percent;
+      }
+      if (volumeInput && typeof data.volume_percent === 'number') {
+        volumeInput.value = String(data.volume_percent);
+      }
       soundStatus.textContent = 'Sound preferences saved';
       handleWebUiToggle();
     } catch (err) {
@@ -584,7 +612,9 @@ body, html {
       'data-tick': { freq: 820, dur: 0.03, vol: 0.09 },
     };
     const entry = palette[kind] || palette['data-tick'];
-    const gainScale = Math.max(0.1, Math.min(1.2, amplitude || 1));
+    const volScale = Math.max(0, Math.min(12, (volumePercent || 0) / 100 * 12));
+    const baseScale = Math.max(0.1, Math.min(1.2, amplitude || 1));
+    const gainScale = volScale === 0 ? 0 : baseScale * volScale;
     const gain = audioCtx.createGain();
     gain.gain.setValueAtTime((entry.vol || 0.1) * gainScale, now);
     gain.connect(audioCtx.destination);
@@ -686,6 +716,7 @@ body, html {
   audioJack?.addEventListener('change', updateSound);
   webUi?.addEventListener('change', updateSound);
   volumeBySignal?.addEventListener('change', updateSound);
+  volumeInput?.addEventListener('change', updateSound);
   modeSelect?.addEventListener('change', savePackets);
   toggleAll?.addEventListener('click', () => {
     const allOn = packetsState.every((p) => !!p.enabled);
@@ -800,6 +831,10 @@ body, html {
                             label { class: "checkbox",
                                 input { id: "volume-by-signal", r#type: "checkbox" }
                                 span { "Volume follows signal strength" }
+                            }
+                            div { class: "volume-field",
+                                label { r#for: "volume-input", "Volume (%)" }
+                                input { id: "volume-input", r#type: "number", min: "0", max: "100", value: "25", inputmode: "numeric" }
                             }
                         }
                         p { class: "caption", "When Web UI is on, ticks play in your browser via WebSocket notifications." }

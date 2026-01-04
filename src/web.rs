@@ -16,7 +16,7 @@ use serde_json;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::process::Command;
@@ -30,6 +30,7 @@ pub struct AppState {
     pub audio_enabled: Arc<AtomicBool>,
     pub web_sound_enabled: Arc<AtomicBool>,
     pub volume_by_signal: Arc<AtomicBool>,
+    pub volume_percent: Arc<AtomicU32>,
     pub packet_tx: broadcast::Sender<PacketEvent>,
     pub channel: ChannelController,
     pub channels_24: Arc<RwLock<Vec<ChannelInfo>>>,
@@ -144,6 +145,7 @@ struct SettingsResponse {
     audio_jack: bool,
     web_ui_sound: bool,
     volume_by_signal: bool,
+    volume_percent: u32,
     available_channels_24ghz: Vec<ChannelInfo>,
     available_channels_5ghz: Vec<ChannelInfo>,
     packet_events: Vec<EventToggle>,
@@ -165,6 +167,7 @@ async fn settings(
         audio_jack: state.audio_enabled.load(Ordering::Relaxed),
         web_ui_sound: state.web_sound_enabled.load(Ordering::Relaxed),
         volume_by_signal: state.volume_by_signal.load(Ordering::Relaxed),
+        volume_percent: state.volume_percent.load(Ordering::Relaxed),
         available_channels_24ghz: channels_24,
         available_channels_5ghz: channels_5,
         packet_events: toggles,
@@ -242,6 +245,7 @@ struct UpdateSoundRequest {
     audio_jack: Option<bool>,
     web_ui: Option<bool>,
     volume_by_signal: Option<bool>,
+    volume_percent: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -249,6 +253,7 @@ struct SoundResponse {
     audio_jack: bool,
     web_ui_sound: bool,
     volume_by_signal: bool,
+    volume_percent: u32,
 }
 
 async fn update_sound(
@@ -264,11 +269,16 @@ async fn update_sound(
     if let Some(v) = body.volume_by_signal {
         state.volume_by_signal.store(v, Ordering::Relaxed);
     }
+    if let Some(vol) = body.volume_percent {
+        let clamped = vol.clamp(0, 100);
+        state.volume_percent.store(clamped, Ordering::Relaxed);
+    }
 
     Ok(Json(SoundResponse {
         audio_jack: state.audio_enabled.load(Ordering::Relaxed),
         web_ui_sound: state.web_sound_enabled.load(Ordering::Relaxed),
         volume_by_signal: state.volume_by_signal.load(Ordering::Relaxed),
+        volume_percent: state.volume_percent.load(Ordering::Relaxed),
     }))
 }
 
@@ -438,7 +448,7 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
             Ok(s) => s,
             Err(_) => continue,
         };
-        if socket.send(Message::Text(payload)).await.is_err() {
+        if socket.send(Message::Text(payload.into())).await.is_err() {
             break;
         }
     }
@@ -474,7 +484,10 @@ async fn send_devices_snapshot(
         devices: snapshot,
     })
     .map_err(|_| ())?;
-    socket.send(Message::Text(payload)).await.map_err(|_| ())
+    socket
+        .send(Message::Text(payload.into()))
+        .await
+        .map_err(|_| ())
 }
 
 #[derive(Serialize)]

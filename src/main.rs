@@ -13,7 +13,7 @@ use crate::events::{EventKind, EventSettings, EventWindow, NoiseMode, PacketEven
 use crate::web::{AppState, ChannelController};
 use anyhow::Result;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -35,6 +35,7 @@ async fn main() -> Result<()> {
     let audio_enabled = Arc::new(AtomicBool::new(true));
     let web_sound_enabled = Arc::new(AtomicBool::new(false));
     let volume_by_signal = Arc::new(AtomicBool::new(false));
+    let volume_percent = Arc::new(AtomicU32::new(25));
     let (packet_notifier_tx, _) = broadcast::channel(64);
     let channel_controller = ChannelController::new(config.monitor_interface.clone());
     let channels_24 = Arc::new(tokio::sync::RwLock::new(Vec::new()));
@@ -59,6 +60,7 @@ async fn main() -> Result<()> {
     let packet_notifier = packet_notifier_tx.clone();
     let settings_handle = event_settings.clone();
     let volume_by_signal_flag = volume_by_signal.clone();
+    let volume_percent_flag = volume_percent.clone();
     let device_filter = device_tracker.clone();
     let audio_task = tokio::spawn(async move {
         let mut window = EventWindow::new(Duration::from_millis(100));
@@ -102,10 +104,13 @@ async fn main() -> Result<()> {
 
             if audio_enabled_flag.load(Ordering::Relaxed) {
                 let sound = sound_for(&evt.kind);
+                let volume_scale = (volume_percent_flag.load(Ordering::Relaxed) as f32 / 100.0
+                    * 12.0)
+                    .clamp(0.0, 12.0);
                 let gain = if volume_by_signal_flag.load(Ordering::Relaxed) {
-                    evt.amplitude
+                    evt.amplitude * volume_scale
                 } else {
-                    1.0
+                    1.0 * volume_scale
                 };
                 audio_task_handle.play(sound, evt.retry, gain);
             }
@@ -120,6 +125,7 @@ async fn main() -> Result<()> {
         audio_enabled,
         web_sound_enabled,
         volume_by_signal,
+        volume_percent,
         packet_tx: packet_notifier_tx,
         channel: channel_controller,
         channels_24,

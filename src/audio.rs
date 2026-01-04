@@ -46,7 +46,7 @@ impl AudioEngine {
             .default_output_config()
             .context("No default output config available")?;
 
-        let sample_rate = config.sample_rate().0;
+        let sample_rate = config.sample_rate();
         let palette = Arc::new(build_palette(sample_rate));
         let queue = Arc::new(Mutex::new(VecDeque::with_capacity(4096)));
         let handle = AudioHandle {
@@ -107,13 +107,14 @@ impl AudioHandle {
         if let Some(queue) = guard.as_mut() {
             if let Some(sound) = self.palette.sounds.get(&id) {
                 for sample in sound.iter() {
-                    queue.push_back(*sample * gain.clamp(0.0, 1.2));
+                    // Allow louder boosts; final clamp happens when samples are popped.
+                    queue.push_back(*sample * gain.clamp(0.0, 12.0));
                 }
             }
             if overlay_retry {
                 if let Some(glitch) = self.palette.sounds.get(&SoundId::RetryGlitch) {
                     for sample in glitch.iter() {
-                        queue.push_back(*sample * gain.clamp(0.0, 1.2));
+                        queue.push_back(*sample * gain.clamp(0.0, 12.0));
                     }
                 }
             }
@@ -195,11 +196,11 @@ fn build_motif(sample_rate: u32, freqs: &[f32], note_ms: u64, volume: f32) -> Ve
 
 fn build_noise(sample_rate: u32, duration_ms: u64, volume: f32) -> Vec<f32> {
     let samples = ((sample_rate as u64 * duration_ms.max(1)) / 1000) as usize;
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..samples)
         .map(|i| {
             let env = 1.0 - (i as f32 / samples as f32);
-            (rand::Rng::r#gen::<f32>(&mut rng) * 2.0 - 1.0) * volume * env
+            (rand::Rng::random::<f32>(&mut rng) * 2.0 - 1.0) * volume * env
         })
         .collect()
 }
